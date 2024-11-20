@@ -1,25 +1,95 @@
-Tax AgentThe agent operates exclusively using data from stored in a GraphDB, structured as a Knowledge Graph (KG).  When a user submits a query, the agent determines whether it is a new query or a follow-up to a previous question.
 
-For a new query, the agent uses the tool, using the user query as input. This tool performs two  key tasks:
+Muddassir
+  3:14 PM
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-1. Document Retrieval
+max_workers = 4
 
-It retrieves the most semantically similar documents from the GraphDB. The retrieval process employs a specialized retrieval query designed to fetch not only the most relevant nodes but also data from their parent and child nodes. This approach ensures a comprehensive context by incorporating additional information that may enhance the response. Distinctions between a node’s data and that of its parent and child nodes are carefully maintained.
+def insert_documents(documents, token_limit=8000):
+    success_docs = []
+    success_metadatas = []
+    success_embeddings = []
+    failed_documents = []
+    failed_metadatas = []
 
+    try:
+        vector_store = chromadb.PersistentClient()
+        collection = vector_store.get_or_create_collection("irm_collection")
+        tokenizer = tiktoken.encoding_for_model("gpt-4")
 
-1. Answer Formulation
+        def chunk_content(content):
+            tokens = tokenizer.encode(content)
+            chunks = [
+                tokenizer.decode(tokens[i:i + token_limit])
+                for i in range(0, len(tokens), token_limit)
+            ]
+            return chunks
 
-Using a prompt, the tool generates a response to the user query based on the retrieved documents. The emphasis is primarily on the node's data, while the parent and child nodes’ information is used as needed to enrich the response.
+        existing_documents = collection.get()['documents'] if collection.count() > 0 else set()
 
-The tool produces two outputs:
-● A direct answer to the user query.
+        all_contents = []
+        all_metadatas = []
 
-● The set of retrieved documents.
+        for doc in documents:
+            content = doc.page_content
+            metadata = doc.metadata
 
-The answer is presented to the user via the frontend, while the retrieved documents are cached for potential use in future interactions. To maintain focus and prevent confusion, any previously cached documents are cleared upon caching the new set.
+            if content in existing_documents:
+                print(f"Skipping duplicate content: {content[:30]}...")
+                continue
 
-If the query is identified as a follow-up or if the previously retrieved documents are sufficient to address the new question, the agent bypasses the retrieval step. Instead, it utilizes the cached documents to construct the response, avoiding redundant queries and ensuring operational efficiency.
+            token_count = len(tokenizer.encode(content))
+            if token_count > token_limit:
+                chunks = chunk_content(content)
+                for chunk in chunks:
+                    all_contents.append(chunk)
+                    all_metadatas.append(metadata)
+            else:
+                all_contents.append(content)
+                all_metadatas.append(metadata)
 
-By distinguishing between new and follow-up queries, the agent demonstrates intelligent decision-making and adaptability. The use of cached documents allows it to maintain continuity and context across interactions, ensuring responses are accurate, relevant, and comprehensive without unnecessarily querying the KG.
+        print("Creating embeddings now")
 
-The tools used in IRM/ Revenue Bulletin/Title 26 works on the same logic as above.  In all three output from tool is answer to user query and retrieved documents. However, the retrieval query and KG used in each is different. This slightly alters the data retrieved in each case as retrieval query partially depends on structure of KG. 
+        def generate_embedding(content, metadata):
+            try:
+                embedding = get_embedding(content)
+                time.sleep(1)
+                return content, metadata, embedding
+            except Exception as e:
+                print(f"Error generating embedding for content: {content[:30]} - {e}")
+                return content, metadata, None
+
+        futures = []
+        with ThreadPoolExecutor(max_workers) as executor:
+            for content, metadata in zip(all_contents, all_metadatas):
+                futures.append(executor.submit(generate_embedding, content, metadata))
+
+            for future in tqdm(as_completed(futures), desc="Generating embeddings", total=len(all_contents)):
+                content, metadata, embedding = future.result()
+                if embedding is not None:
+                    success_docs.append(content)
+                    success_metadatas.append(metadata)
+                    success_embeddings.append(embedding)
+                else:
+                    failed_documents.append(content)
+                    failed_metadatas.append(metadata)
+
+        if success_docs:
+            collection.add(
+                documents=success_docs,
+                embeddings=success_embeddings,
+                metadatas=success_metadatas,
+                ids=[str(uuid4()) for _ in success_docs]
+            )
+            print(f"Successfully added {len(success_docs)} embeddings to the collection.")
+        else:
+            print("No embeddings were successfully created to add to the collection.")
+
+        print(f"Failed to generate embeddings for {len(failed_documents)} document(s).")
+        return success_docs, success_metadatas, failed_documents, failed_metadatas,success_embeddings
+    except Exception as e:
+        print(f"Error inserting documents: {e}")
+        
+        return success_docs, success_metadatas, failed_documents, failed_metadatas, success_embeddings
+
+success_docs, success_metadatas, failed_documents, failed_metadatas,success_embeddings=insert_documents(all_documents)
